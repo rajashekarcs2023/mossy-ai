@@ -1,6 +1,7 @@
 'use client';
 
 import { Suspense, useCallback, useEffect, useState } from 'react';
+import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
 import {
   type BriefingItem,
@@ -128,12 +129,20 @@ function DeskInner() {
             Human takeover — full call memory, picked up from Moss by session name.
           </p>
         </div>
-        <button
-          onClick={() => load(callId)}
-          className="border-border hover:bg-muted rounded-lg border px-3 py-2 text-sm font-medium"
-        >
-          {loading ? 'Loading…' : 'Refresh'}
-        </button>
+        <div className="flex items-center gap-2">
+          <Link
+            href="/desk/analytics"
+            className="border-border hover:bg-muted rounded-lg border px-3 py-2 text-sm font-medium"
+          >
+            Analytics
+          </Link>
+          <button
+            onClick={() => load(callId)}
+            className="border-border hover:bg-muted rounded-lg border px-3 py-2 text-sm font-medium"
+          >
+            {loading ? 'Loading…' : 'Refresh'}
+          </button>
+        </div>
       </div>
 
       {/* Call id input (fallback when not arriving from a link) */}

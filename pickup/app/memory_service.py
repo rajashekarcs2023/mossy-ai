@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -29,6 +29,28 @@ from moss import MossClient, GetDocumentsOptions, QueryOptions
 
 load_dotenv()
 logger = logging.getLogger("pickup-memory")
+
+# Staff auth (SHARED CONTRACT): clients send "X-Pickup-Key"; we ENFORCE it on
+# /memory/* and /analytics ONLY IF PICKUP_STAFF_KEY is set. If unset we allow
+# (dev/demo keeps working) and log a one-time warning. /health stays open.
+PICKUP_STAFF_KEY = os.getenv("PICKUP_STAFF_KEY")
+PICKUP_DESK_ORIGIN = os.getenv("PICKUP_DESK_ORIGIN", "http://localhost:3000")
+_auth_warned = False
+
+
+async def require_staff(x_pickup_key: str | None = Header(default=None)) -> None:
+    """Dependency: gate staff endpoints on the X-Pickup-Key header when configured."""
+    global _auth_warned
+    if not PICKUP_STAFF_KEY:
+        if not _auth_warned:
+            logger.warning(
+                "PICKUP_STAFF_KEY is not set — staff endpoints are UNAUTHENTICATED "
+                "(dev/demo mode). Set PICKUP_STAFF_KEY to enforce X-Pickup-Key."
+            )
+            _auth_warned = True
+        return
+    if x_pickup_key != PICKUP_STAFF_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Pickup-Key")
 
 # MiniMax (sponsor) — used to SYNTHESIZE the human briefing from the recalled
 # Moss session turns. OpenAI-compatible endpoint; falls back to raw retrieval
@@ -87,7 +109,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Pickup Memory Service", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # demo only
+    allow_origins=[PICKUP_DESK_ORIGIN],  # SHARED CONTRACT: restrict to the desk origin
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -103,7 +125,7 @@ async def health():
     return {"ok": True, "cached_calls": list(_sessions.keys())}
 
 
-@app.get("/memory/{call_id}")
+@app.get("/memory/{call_id}", dependencies=[Depends(require_staff)])
 async def get_memory(call_id: str, refresh: bool = True):
     """Full call memory: ordered transcript + an auto-generated human briefing."""
     session = await _get_session(call_id, refresh=refresh)
@@ -182,7 +204,7 @@ async def _synthesize_briefing(turns: list[dict]) -> list[dict] | None:
         return None
 
 
-@app.post("/memory/{call_id}/query")
+@app.post("/memory/{call_id}/query", dependencies=[Depends(require_staff)])
 async def query_memory(call_id: str, body: QueryBody):
     """Let the human ask a free-form question of the call memory (sub-10ms)."""
     session = await _get_session(call_id, refresh=False)
@@ -192,3 +214,107 @@ async def query_memory(call_id: str, body: QueryBody):
         speaker, text = _clean(d.text)
         results.append({"id": d.id, "speaker": speaker, "text": text, "score": round(d.score, 3)})
     return {"call_id": call_id, "query": body.query, "results": results}
+
+
+@app.delete("/memory/{call_id}", dependencies=[Depends(require_staff)])
+async def delete_memory(call_id: str):
+    """Right-to-be-forgotten: delete the call's Moss index + drop it from cache."""
+    try:
+        await _client.delete_index(call_id)
+    except Exception as e:
+        msg = str(e).lower()
+        if "not found" in msg or "404" in msg or "does not exist" in msg:
+            raise HTTPException(status_code=404, detail=f"No memory for call '{call_id}': {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete call '{call_id}': {e}")
+    _sessions.pop(call_id, None)
+    return {"call_id": call_id, "deleted": True}
+
+
+# Analytics shape (SHARED CONTRACT) — best-effort, fast, never 500.
+_ANALYTICS_ZERO = {
+    "total_calls": 0,
+    "bookings": 0,
+    "messages": 0,
+    "escalations": 0,
+    "by_intent": [],
+    "languages": [],
+}
+_ANALYTICS_SESSION_CAP = 50
+
+
+def _doc_text(d) -> str:
+    return getattr(d, "text", "") or ""
+
+
+def _doc_meta(d) -> dict:
+    return getattr(d, "metadata", None) or {}
+
+
+@app.get("/analytics", dependencies=[Depends(require_staff)])
+async def analytics():
+    """Aggregate desk stats over customer- sessions. Best-effort; zeros on failure."""
+    try:
+        indexes = await _client.list_indexes()
+    except Exception as e:
+        logger.warning("analytics: list_indexes failed (%s); returning zeros", e)
+        return dict(_ANALYTICS_ZERO)
+
+    names = [ix.name for ix in indexes if (ix.name or "").startswith("customer-")]
+    names = names[:_ANALYTICS_SESSION_CAP]
+
+    bookings = messages = escalations = 0
+    intent_counts: dict[str, int] = {}
+    lang_counts: dict[str, int] = {}
+
+    async def load(name: str):
+        try:
+            return await _client.get_docs(name, GetDocumentsOptions(doc_ids=None))
+        except Exception as e:  # one bad session must not sink the whole report
+            logger.warning("analytics: get_docs failed for %s (%s)", name, e)
+            return []
+
+    try:
+        per_session = await asyncio.gather(*(load(n) for n in names))
+    except Exception as e:
+        logger.warning("analytics: doc load failed (%s); returning zeros", e)
+        return dict(_ANALYTICS_ZERO)
+
+    for docs in per_session:
+        for d in docs:
+            text = _doc_text(d)
+            meta = _doc_meta(d)
+            mtype = (meta.get("type") or "").lower()
+
+            if text.startswith("[action] Booked") or mtype == "appointment":
+                bookings += 1
+                intent_counts["booking"] = intent_counts.get("booking", 0) + 1
+            if mtype == "message" or text.startswith("[action] Message"):
+                messages += 1
+                intent_counts["message"] = intent_counts.get("message", 0) + 1
+            if mtype in ("escalation", "human_escalation") or text.startswith("[action] Escalat"):
+                escalations += 1
+                intent_counts["escalation"] = intent_counts.get("escalation", 0) + 1
+
+            lang = meta.get("lang") or meta.get("language")
+            if lang:
+                lang_counts[str(lang)] = lang_counts.get(str(lang), 0) + 1
+
+    by_intent = sorted(
+        ({"intent": k, "count": v} for k, v in intent_counts.items()),
+        key=lambda x: x["count"],
+        reverse=True,
+    )
+    languages = sorted(
+        ({"lang": k, "count": v} for k, v in lang_counts.items()),
+        key=lambda x: x["count"],
+        reverse=True,
+    )
+
+    return {
+        "total_calls": len(names),
+        "bookings": bookings,
+        "messages": messages,
+        "escalations": escalations,
+        "by_intent": by_intent,
+        "languages": languages,
+    }
