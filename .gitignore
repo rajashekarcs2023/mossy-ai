@@ -1,15 +1,23 @@
-# Track only the pickup/ project. Ignore everything else at the repo root —
-# the vendored Moss repos (moss-main), the app scaffold (moss-hacker-starter),
-# and the reference docs (project-dev).
-/*
-!/.gitignore
-!/README.md
-!/pickup/
+# Vendored Moss repo, original scaffold clone, and reference docs — not source.
+/moss-main/
+/moss-hacker-starter/
+/project-dev/
 
-# Never commit secrets, virtualenvs, or caches (even inside pickup/).
-pickup/.env
-**/.venv/
-**/__pycache__/
+# Secrets — never commit
+.env
+.env.local
+*.env.local
+
+# Local tooling config
+.claude/
+
+# Dependencies, build output, caches
+node_modules/
+.next/
+.turbo/
+.venv/
+__pycache__/
 *.pyc
 *.pyo
+.ruff_cache/
 .DS_Store
